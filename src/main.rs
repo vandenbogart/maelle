@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::io::{BufRead, Write, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Write};
 
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "type")]
@@ -22,6 +22,14 @@ enum Payload {
         in_reply_to: usize,
         echo: String,
     },
+    Generate {
+        msg_id: usize,
+    },
+    GenerateOk {
+        msg_id: usize,
+        in_reply_to: usize,
+        id: String,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -38,31 +46,47 @@ struct Node {
 }
 impl Node {
     fn new(id: String, node_ids: Vec<String>) -> Self {
-        Self { id, node_ids, last_msg_id: 0 }
+        Self {
+            id,
+            node_ids,
+            last_msg_id: 0,
+        }
     }
     fn next_msg_id(&mut self) -> usize {
         self.last_msg_id += 1;
         self.last_msg_id
     }
+    fn gen_unique_id(&mut self) -> String {
+        let mut copied_node_id = self.id.clone();
+        copied_node_id.push_str(&self.last_msg_id.to_string());
+        copied_node_id
+    }
 }
 
 fn init_node(is: &mut impl Read, os: &mut impl Write) -> anyhow::Result<Node> {
     let mut line = String::new();
-    BufReader::new(is).read_line(&mut line).expect("failed to read init message");
+    BufReader::new(is)
+        .read_line(&mut line)
+        .expect("failed to read init message");
     let m: Message = serde_json::from_str(&line).expect("failed to deserialize init message");
     let node = match m.body {
-        Payload::Init { msg_id, node_id, node_ids } => {
+        Payload::Init {
+            msg_id,
+            node_id,
+            node_ids,
+        } => {
             let resp = Message {
                 src: node_id.clone(),
                 dest: m.src,
-                body: Payload::InitOk { in_reply_to: msg_id },
+                body: Payload::InitOk {
+                    in_reply_to: msg_id,
+                },
             };
             serde_json::to_writer(&mut *os, &resp)?;
-            let newline = "\n".as_bytes();
-            os.write(newline)?;
+            os.write(b"\n")?;
             os.flush()?;
             Node::new(node_id, node_ids)
-        },
+        }
         _ => anyhow::bail!("received non init message before init"),
     };
 
@@ -92,8 +116,7 @@ fn main() -> anyhow::Result<()> {
                     },
                 };
                 serde_json::to_writer(&mut stdout, &resp)?;
-                let newline = "\n".as_bytes();
-                stdout.write(newline)?;
+                stdout.write(b"\n")?;
                 stdout.flush()?;
             }
             Payload::EchoOk {
@@ -101,7 +124,26 @@ fn main() -> anyhow::Result<()> {
                 in_reply_to,
                 echo,
             } => (),
-            _ => anyhow::bail!("invalid message received")
+            Payload::Generate { msg_id } => {
+                let resp = Message {
+                    src: node.id.clone(),
+                    dest: m.src,
+                    body: Payload::GenerateOk {
+                        msg_id: node.next_msg_id(),
+                        in_reply_to: msg_id,
+                        id: node.gen_unique_id(),
+                    },
+                };
+                serde_json::to_writer(&mut stdout, &resp)?;
+                stdout.write(b"\n")?;
+                stdout.flush()?;
+            }
+            Payload::GenerateOk {
+                msg_id,
+                in_reply_to,
+                id,
+            } => (),
+            _ => anyhow::bail!("invalid message received"),
         }
     }
     Ok(())
