@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     io::{BufRead, BufReader, Read, Write},
-    sync::{Arc, Mutex, RwLock},
+    sync::{Arc, Mutex, RwLock, mpsc},
 };
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -90,7 +90,7 @@ struct Node {
     last_msg_id: usize,
     topology: HashMap<String, Vec<String>>,
     messages: HashSet<usize>,
-    callbacks: HashMap<usize, String>,
+    callbacks: HashMap<usize, (String, usize)>,
 }
 impl Node {
     fn new(id: String, node_ids: Vec<String>) -> Self {
@@ -172,6 +172,30 @@ fn main() -> anyhow::Result<()> {
 
     let mut reader = stdin.lines();
 
+    let (retry_thread, kill_channel) = {
+        let (tx, rx) = mpsc::channel::<bool>();
+        let node = Arc::clone(&node);
+        let handle = std::thread::spawn(move || -> anyhow::Result<()> {
+            loop {
+                match rx.try_recv() {
+                    Ok(_) => break,
+                    Err(_) => (),
+                }
+                {
+                    let mut node = node.lock().expect("failed to lock node");
+                    for (_, (n_id, message)) in node.callbacks.clone().iter() {
+                        let msg_id = node.next_msg_id();
+                        let body = Payload::Broadcast { msg_id, message: message.clone() };
+                        send_message(node.id.clone(), n_id.clone(), body)?;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100))
+            }
+            Ok(())
+        });
+        (handle, tx)
+    };
+
     while let Some(line) = reader.next() {
         let line = line.expect("failed to read line from input stream");
         let m: Message = serde_json::from_str(&line).expect("failed to deserialize message");
@@ -241,7 +265,7 @@ fn main() -> anyhow::Result<()> {
                             }
                             let msg_id = node.next_msg_id();
                             let body = Payload::Broadcast { msg_id, message };
-                            node.callbacks.insert(msg_id, n.clone());
+                            node.callbacks.insert(msg_id, (n.clone(), message));
                             send_message(node.id.clone(), n, body)?;
                         }
                     };
@@ -282,6 +306,9 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         });
     }
+
+    kill_channel.send(true)?;
+    std::thread::sleep(std::time::Duration::from_millis(1000));
 
     Ok(())
 }
