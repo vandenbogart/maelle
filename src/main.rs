@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
-    io::{BufRead, BufReader, Read, Write},
+    collections::{HashMap, HashSet},
+    io::{BufRead, BufReader, Read, Write}, sync::{Arc, RwLock, Mutex},
 };
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -41,6 +41,39 @@ enum Payload {
         msg_id: usize,
         in_reply_to: usize,
     },
+    Broadcast {
+        msg_id: usize,
+        message: usize,
+    },
+    BroadcastOk {
+        msg_id: usize,
+        in_reply_to: usize,
+    },
+    Read {
+        msg_id: usize,
+    },
+    ReadOk {
+        msg_id: usize,
+        in_reply_to: usize,
+        messages: Vec<usize>,
+    },
+    // Add {
+    //     msg_id: usize,
+    //     delta: usize,
+    // },
+    // AddOk {
+    //     msg_id: usize,
+    //     in_reply_to: usize,
+    // },
+    // Write {
+    //     msg_id: usize,
+    //     key: String,
+    //     value: usize,
+    // },
+    // WriteOk {
+    //     msg_id: usize,
+    //     in_reply_to: usize,
+    // },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -55,6 +88,7 @@ struct Node {
     node_ids: Vec<String>,
     last_msg_id: usize,
     topology: HashMap<String, Vec<String>>,
+    messages: HashSet<usize>,
 }
 impl Node {
     fn new(id: String, node_ids: Vec<String>) -> Self {
@@ -63,6 +97,7 @@ impl Node {
             node_ids,
             last_msg_id: 0,
             topology: HashMap::new(),
+            messages: HashSet::new(),
         }
     }
     fn next_msg_id(&mut self) -> usize {
@@ -106,10 +141,30 @@ fn init_node(is: &mut impl Read, os: &mut impl Write) -> anyhow::Result<Node> {
     Ok(node)
 }
 
+fn send_message(
+    os: &mut impl Write,
+    src: String,
+    dest: String,
+    body: Payload,
+) -> anyhow::Result<()> {
+    let resp = Message { src, dest, body };
+    serde_json::to_writer(&mut *os, &resp)?;
+    os.write(b"\n")?;
+    os.flush()?;
+    Ok(())
+}
+
+// fn request_key(os: &mut impl Write, src: String, body: Payload) -> anyhow::Result<()> {
+//     let body = Payload::Read { msg_id:  }
+
+//     Ok(())
+// }
+
 fn main() -> anyhow::Result<()> {
     let mut stdin = std::io::stdin().lock();
     let mut stdout = std::io::stdout().lock();
-    let mut node = init_node(&mut stdin, &mut stdout)?;
+    let node = init_node(&mut stdin, &mut stdout)?;
+    let node = Arc::new(Mutex::new(node));
 
     let mut reader = stdin.lines();
 
@@ -119,18 +174,13 @@ fn main() -> anyhow::Result<()> {
 
         match m.body {
             Payload::Echo { msg_id, echo } => {
-                let resp = Message {
-                    src: node.id.clone(),
-                    dest: m.src,
-                    body: Payload::EchoOk {
-                        msg_id: node.next_msg_id(),
-                        in_reply_to: msg_id,
-                        echo,
-                    },
+                let mut node = node.lock().expect("failed to aquire read lock on node");
+                let body = Payload::EchoOk {
+                    msg_id: node.next_msg_id(),
+                    in_reply_to: msg_id,
+                    echo,
                 };
-                serde_json::to_writer(&mut stdout, &resp)?;
-                stdout.write(b"\n")?;
-                stdout.flush()?;
+                send_message(&mut stdout, node.id.clone(), m.src, body)?;
             }
             Payload::EchoOk {
                 msg_id,
@@ -138,18 +188,13 @@ fn main() -> anyhow::Result<()> {
                 echo,
             } => (),
             Payload::Generate { msg_id } => {
-                let resp = Message {
-                    src: node.id.clone(),
-                    dest: m.src,
-                    body: Payload::GenerateOk {
-                        msg_id: node.next_msg_id(),
-                        in_reply_to: msg_id,
-                        id: node.gen_unique_id(),
-                    },
+                let mut node = node.lock().expect("failed to aquire read lock on node");
+                let body = Payload::GenerateOk {
+                    msg_id: node.next_msg_id(),
+                    in_reply_to: msg_id,
+                    id: node.gen_unique_id(),
                 };
-                serde_json::to_writer(&mut stdout, &resp)?;
-                stdout.write(b"\n")?;
-                stdout.flush()?;
+                send_message(&mut stdout, node.id.clone(), m.src, body)?;
             }
             Payload::GenerateOk {
                 msg_id,
@@ -157,24 +202,66 @@ fn main() -> anyhow::Result<()> {
                 id,
             } => (),
             Payload::Topology { topology, msg_id } => {
+                let mut node = node.lock().expect("failed to aquire read lock on node");
                 node.topology = topology;
-                let resp = Message {
-                    src: node.id.clone(),
-                    dest: m.src,
-                    body: Payload::TopologyOk {
-                        msg_id: node.next_msg_id(),
-                        in_reply_to: msg_id,
-                    },
+                let body = Payload::TopologyOk {
+                    msg_id: node.next_msg_id(),
+                    in_reply_to: msg_id,
                 };
-                serde_json::to_writer(&mut stdout, &resp)?;
-                stdout.write(b"\n")?;
-                stdout.flush()?;
+                send_message(&mut stdout, node.id.clone(), m.src, body)?;
             }
             Payload::TopologyOk {
                 msg_id,
                 in_reply_to,
             } => (),
+            Payload::Broadcast { msg_id, message } => {
+                let mut node = node.lock().expect("failed to aquire read lock on node");
+                let body = Payload::BroadcastOk {
+                    msg_id: node.next_msg_id(),
+                    in_reply_to: msg_id,
+                };
+                send_message(&mut stdout, node.id.clone(), m.src, body)?;
+                if !node.messages.contains(&message) {
+                    node.messages.insert(message);
+                    let node_id = node.id.clone();
+                    let neighbors = node.topology.get(&node_id).expect("failed get topology").clone();
+                    for n in neighbors.into_iter() {
+                        let body = Payload::Broadcast {
+                            msg_id: node.next_msg_id(),
+                            message,
+                        };
+                        send_message(&mut stdout, node.id.clone(), n, body)?;
+                    }
+                };
+
+            }
+            Payload::BroadcastOk {
+                msg_id,
+                in_reply_to,
+            } => (),
+            Payload::Read { msg_id } => {
+                let mut node = node.lock().expect("failed to aquire read lock on node");
+                let body = Payload::ReadOk {
+                    msg_id: node.next_msg_id(),
+                    in_reply_to: msg_id,
+                    messages: node.messages.clone().into_iter().collect(),
+                };
+                send_message(&mut stdout, node.id.clone(), m.src, body)?;
+            }
+            Payload::ReadOk {
+                msg_id,
+                in_reply_to,
+                messages,
+            } => (),
             _ => anyhow::bail!("invalid message received"),
+            // Payload::Add { msg_id, delta } => {
+            //     let write_body = Payload::Write {
+            //         msg_id,
+            //         key: "g_counter".to_string(),
+            //         value: delta,
+            //     }
+
+            // },
         }
     }
     Ok(())
