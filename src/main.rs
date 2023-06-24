@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::{
+    collections::HashMap,
+    io::{BufRead, BufReader, Read, Write},
+};
 
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "type")]
@@ -30,6 +33,14 @@ enum Payload {
         in_reply_to: usize,
         id: String,
     },
+    Topology {
+        topology: HashMap<String, Vec<String>>,
+        msg_id: usize,
+    },
+    TopologyOk {
+        msg_id: usize,
+        in_reply_to: usize,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -43,6 +54,7 @@ struct Node {
     id: String,
     node_ids: Vec<String>,
     last_msg_id: usize,
+    topology: HashMap<String, Vec<String>>,
 }
 impl Node {
     fn new(id: String, node_ids: Vec<String>) -> Self {
@@ -50,6 +62,7 @@ impl Node {
             id,
             node_ids,
             last_msg_id: 0,
+            topology: HashMap::new(),
         }
     }
     fn next_msg_id(&mut self) -> usize {
@@ -142,6 +155,24 @@ fn main() -> anyhow::Result<()> {
                 msg_id,
                 in_reply_to,
                 id,
+            } => (),
+            Payload::Topology { topology, msg_id } => {
+                node.topology = topology;
+                let resp = Message {
+                    src: node.id.clone(),
+                    dest: m.src,
+                    body: Payload::TopologyOk {
+                        msg_id: node.next_msg_id(),
+                        in_reply_to: msg_id,
+                    },
+                };
+                serde_json::to_writer(&mut stdout, &resp)?;
+                stdout.write(b"\n")?;
+                stdout.flush()?;
+            }
+            Payload::TopologyOk {
+                msg_id,
+                in_reply_to,
             } => (),
             _ => anyhow::bail!("invalid message received"),
         }
